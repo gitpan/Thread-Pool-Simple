@@ -1,5 +1,5 @@
-Thread/Pool/Simple version 0.01
-===============================
+Thread/Pool/Simple
+==================
 
 Thread::Pool::Simple provides a simple thread-pool implementaion
 without external dependencies outside core modules.

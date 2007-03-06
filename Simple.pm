@@ -8,7 +8,7 @@ use Carp;
 use Storable qw(nfreeze thaw);
 use Thread::Queue;
 
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 sub new {
     my $class = shift;
@@ -22,7 +22,9 @@ sub new {
         $config{$_} = $arg{$_} if exists $arg{$_};
     }
     my %code_ref;
-    @code_ref{'pre', 'do', 'post'} = @arg{'pre', 'do', 'post'};
+    $code_ref{pre} = $arg{pre} || [];
+    $code_ref{do} = $arg{do} || [];
+    $code_ref{post} = $arg{post} || [];
 
     my %obj : shared;
     my $self = \%obj;
@@ -72,20 +74,20 @@ sub _handle {
         }
         last unless $lifespan-- && !$self->terminating();
         my $do_code = $code_ref->{do};
-        next unless 'CODE' eq ref $do_code;
+        next unless 'CODE' eq ref $do_code->[0];
         my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
         last if $id == 1;
         my $arg = thaw($job);
         my @ret;
         if ($id == 0) {
-            eval { scalar $do_code->(@$arg) };
+            eval { scalar $do_code->[0](splice(@$do_code, 1), @$arg) };
             next;
         }
         elsif ($id % 2) {
-            $ret[0] = eval { $do_code->(@$arg) };
+            $ret[0] = eval { $do_code->[0](splice(@$do_code, 1), @$arg) };
         }
         else {
-            @ret = eval { $do_code->(@$arg) };
+            @ret = eval { $do_code->[0](splice(@$do_code,1), @$arg) };
         }
         $ret[0] = $@ if $@;
             my $ret = nfreeze(\@ret);
@@ -97,8 +99,8 @@ sub _handle {
         threads->yield();
     }
     my $post_code = $code_ref->{post};
-    if ('CODE' eq ref $post_code) {
-        eval { $post_code->() };
+    if ('CODE' eq ref $post_code->[0]) {
+        eval { $post_code->[0](splice(@$post_code, 1)) };
         carp $@ if $@;
     }
     my $worker = $self->{worker};
@@ -160,8 +162,8 @@ sub increase {
         my $max = do { lock %{$self->{config}}; $self->{config}{max} };
         return if $worker->{count} > $max;
         my $pre_code = $code_ref->{pre};
-        if ('CODE' eq ref $pre_code) {
-            eval { $pre_code->() };
+        if ('CODE' eq ref $pre_code->[0]) {
+            eval { $pre_code->[0](splice(@$pre_code, 1)) };
             carp $@ if $@;
         }
         threads->create(\&_handle, $self, $code_ref)->detach();
@@ -205,7 +207,7 @@ sub add {
     while (1) {
         $id = int(rand(time())) if defined $context;
         next if defined $context && $id < 10;
-        ++$id if $context == $id % 2;
+        ++$id if defined $context && $context == $id % 2;
         lock %{$self->{done}};
         last unless exists $self->{done}{$id};
     }

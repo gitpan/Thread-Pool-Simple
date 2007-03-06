@@ -12,7 +12,7 @@ use Test::More qw(no_plan);
 BEGIN { use_ok('Thread::Pool::Simple') };
 
 my $pool = Thread::Pool::Simple->new(min => 5,
-                                     do => sub { return @_; },
+                                     do => [sub { return @_; }],
                                     );
 
 

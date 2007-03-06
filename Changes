@@ -1,6 +1,9 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
-0.01  Tue Feb 27 13:41:35 2007
+0.02  6 MAR 2007
+        - pass default parameters to the handler
+
+0.01  27 FEB 2007
         - imitial version  
 	- original version; created by h2xs 1.22 with options
 		-XA Thread::Pool::Simple
