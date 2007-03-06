@@ -1,5 +1,8 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.03  6 MAR 2007
+        - fixed a bug that passes wrong arguments to the handler
+
 0.02  6 MAR 2007
         - pass default parameters to the handler
 

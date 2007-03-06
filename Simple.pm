@@ -8,7 +8,7 @@ use Carp;
 use Storable qw(nfreeze thaw);
 use Thread::Queue;
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 sub new {
     my $class = shift;
@@ -74,23 +74,24 @@ sub _handle {
         }
         last unless $lifespan-- && !$self->terminating();
         my $do_code = $code_ref->{do};
-        next unless 'CODE' eq ref $do_code->[0];
+        my $do_func = shift @$do_code;
+        next unless 'CODE' eq ref $do_func;
         my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
         last if $id == 1;
         my $arg = thaw($job);
         my @ret;
         if ($id == 0) {
-            eval { scalar $do_code->[0](splice(@$do_code, 1), @$arg) };
+            eval { scalar $do_func->(@$do_code, @$arg) };
             next;
         }
         elsif ($id % 2) {
-            $ret[0] = eval { $do_code->[0](splice(@$do_code, 1), @$arg) };
+            $ret[0] = eval { $do_func->(@$do_code, @$arg) };
         }
         else {
-            @ret = eval { $do_code->[0](splice(@$do_code,1), @$arg) };
+            @ret = eval { $do_func->(@$do_code, @$arg) };
         }
         $ret[0] = $@ if $@;
-            my $ret = nfreeze(\@ret);
+        my $ret = nfreeze(\@ret);
         {
             lock %{$self->{done}};
             $self->{done}{$id} = $ret;
@@ -99,8 +100,9 @@ sub _handle {
         threads->yield();
     }
     my $post_code = $code_ref->{post};
-    if ('CODE' eq ref $post_code->[0]) {
-        eval { $post_code->[0](splice(@$post_code, 1)) };
+    my $post_func = shift @$post_code;
+    if ('CODE' eq ref $post_func) {
+        eval { $post_func->(@$post_code) };
         carp $@ if $@;
     }
     my $worker = $self->{worker};
@@ -162,8 +164,9 @@ sub increase {
         my $max = do { lock %{$self->{config}}; $self->{config}{max} };
         return if $worker->{count} > $max;
         my $pre_code = $code_ref->{pre};
-        if ('CODE' eq ref $pre_code->[0]) {
-            eval { $pre_code->[0](splice(@$pre_code, 1)) };
+        my $pre_func = shift @$pre_code;
+        if ('CODE' eq ref $pre_func) {
+            eval { $pre_func->(@$pre_code) };
             carp $@ if $@;
         }
         threads->create(\&_handle, $self, $code_ref)->detach();
@@ -255,9 +258,9 @@ Thread::Pool::Simple - A simple thread-pool implementation
                  max => 5,           # at most 5 workers
                  load => 10,         # increase worker if on average every worker has 10 jobs waiting
                  lifespan => 1000,   # work retires after 1000 jobs
-                 pre => \&pre_handle, # run before creating worker thread
-                 do => \&do_handle,   # job handler for each worker
-                 post => \&post_handle, # run after worker threads end
+                 pre => [\&pre_handle, $arg1, $arg2, ...]   # run before creating worker thread
+                 do => [\&do_handle, $arg1, $arg2, ...]     # job handler for each worker
+                 post => [\&post_handle, $arg1, $arg2, ...] # run after worker threads end
                );
 
   my ($id1) = $pool->add(@arg1); #call in list context
