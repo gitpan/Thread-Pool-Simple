@@ -1,5 +1,9 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.04  7 MAR 2007
+        - remove lifespan, pause, and resume
+        - add `passid' config option
+
 0.03  6 MAR 2007
         - fixed a bug that passes wrong arguments to the handler
 

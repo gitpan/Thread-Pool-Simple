@@ -8,7 +8,7 @@ use Carp;
 use Storable qw(nfreeze thaw);
 use Thread::Queue;
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 sub new {
     my $class = shift;
@@ -16,9 +16,9 @@ sub new {
     my %config : shared = (min => 1,
                            max => 10,
                            load => 100,
-                           lifespan => 1000,
+                           passid => 0,
                           );
-    for ('min', 'max', 'load', 'lifespan') {
+    for ('min', 'max', 'load', 'passid') {
         $config{$_} = $arg{$_} if exists $arg{$_};
     }
     my %code_ref;
@@ -46,12 +46,6 @@ sub new {
 sub _run {
     my ($self, $code_ref) = @_;
     while (1) {
-        {
-            if (!$self->_state()) {
-                sleep 1;
-                next;
-            }
-        }
         last if $self->terminating();
         $self->increase($code_ref) if $self->busy();
         threads->yield();
@@ -64,31 +58,26 @@ sub _run {
 
 sub _handle {
     my ($self, $code_ref) = @_;
-    my $lifespan = do { lock %{$self->{config}}; $self->{config}{lifespan} };
-    while (1) {
-        {
-            if (!$self->_state()) {
-                sleep 1;
-                redo;
-            }
-        }
-        last unless $lifespan-- && !$self->terminating();
-        my $do_code = $code_ref->{do};
-        my $do_func = shift @$do_code;
-        next unless 'CODE' eq ref $do_func;
+    my $do_code = $code_ref->{do};
+    my $do_func = shift @$do_code;
+    my $passid = $self->{config}{passid};
+    while (!$self->terminating()
+           && 'CODE' eq ref $do_func
+          ) {
+
         my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
         last if $id == 1;
         my $arg = thaw($job);
         my @ret;
         if ($id == 0) {
-            eval { scalar $do_func->(@$do_code, @$arg) };
+            eval { scalar $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
             next;
         }
         elsif ($id % 2) {
-            $ret[0] = eval { $do_func->(@$do_code, @$arg) };
+            $ret[0] = eval { $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
         }
         else {
-            @ret = eval { $do_func->(@$do_code, @$arg) };
+            @ret = eval { $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
         }
         $ret[0] = $@ if $@;
         my $ret = nfreeze(\@ret);
@@ -126,23 +115,6 @@ sub detach {
     my $worker = $self->{worker};
     lock %$worker;
     $self->{pending}->enqueue((pack('Na*', 1, '')) x $worker->{count});
-}
-
-sub pause {
-    my ($self) = @_;
-    return unless $self->_state() > 0;
-    $self->_state(0);
-}
-
-sub resume {
-    my ($self) = @_;
-    return if $self->_state();
-    $self->_state(1);
-}
-
-sub running {
-    my ($self) = @_;
-    return if $self->_state() > 0;
 }
 
 sub terminating {
@@ -257,10 +229,10 @@ Thread::Pool::Simple - A simple thread-pool implementation
                  min => 3,           # at least 3 workers
                  max => 5,           # at most 5 workers
                  load => 10,         # increase worker if on average every worker has 10 jobs waiting
-                 lifespan => 1000,   # work retires after 1000 jobs
                  pre => [\&pre_handle, $arg1, $arg2, ...]   # run before creating worker thread
                  do => [\&do_handle, $arg1, $arg2, ...]     # job handler for each worker
                  post => [\&post_handle, $arg1, $arg2, ...] # run after worker threads end
+                 passid => 1,        # whether to pass the job id as the first argument to the &do_handle
                );
 
   my ($id1) = $pool->add(@arg1); #call in list context
