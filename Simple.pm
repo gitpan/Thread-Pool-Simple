@@ -8,7 +8,7 @@ use Carp;
 use Storable qw(nfreeze thaw);
 use Thread::Queue;
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 sub new {
     my $class = shift;
@@ -17,8 +17,9 @@ sub new {
                            max => 10,
                            load => 100,
                            passid => 0,
+                           lifespan => 1000,
                           );
-    for ('min', 'max', 'load', 'passid') {
+    for ('min', 'max', 'load', 'passid', 'lifespan') {
         $config{$_} = $arg{$_} if exists $arg{$_};
     }
     my %code_ref;
@@ -60,8 +61,9 @@ sub _handle {
     my ($self, $code_ref) = @_;
     my $do_code = $code_ref->{do};
     my $do_func = shift @$do_code;
-    my $passid = $self->{config}{passid};
+    my ($passid, $lifespan) = do { lock %{$self->{config}}; @{$self->{config}}{'passid', 'lifespan'} };
     while (!$self->terminating()
+           && $lifespan--
            && 'CODE' eq ref $do_func
           ) {
 
@@ -134,7 +136,7 @@ sub increase {
         my $worker = $self->{worker};
         lock %$worker;
         my $max = do { lock %{$self->{config}}; $self->{config}{max} };
-        return if $worker->{count} > $max;
+        return if $worker->{count} == $max;
         my $pre_code = $code_ref->{pre};
         my $pre_func = shift @$pre_code;
         if ('CODE' eq ref $pre_func) {
@@ -233,6 +235,7 @@ Thread::Pool::Simple - A simple thread-pool implementation
                  do => [\&do_handle, $arg1, $arg2, ...]     # job handler for each worker
                  post => [\&post_handle, $arg1, $arg2, ...] # run after worker threads end
                  passid => 1,        # whether to pass the job id as the first argument to the &do_handle
+                 lifespan => 10000,  # total jobs handled by each worker
                );
 
   my ($id1) = $pool->add(@arg1); #call in list context
