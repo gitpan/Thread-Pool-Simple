@@ -4,4 +4,6 @@ MANIFEST
 README
 Simple.pm
 t/1.t
+t/2.t
+t/3.t
 META.yml                                 Module meta-data (added by MakeMaker)

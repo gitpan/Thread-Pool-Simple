@@ -7,154 +7,126 @@ use warnings;
 use Carp;
 use Storable qw(nfreeze thaw);
 use Thread::Queue;
+use Thread::Semaphore;
 
-our $VERSION = '0.05';
+our $VERSION = '0.10';
 
 sub new {
     my $class = shift;
     my %arg = @_;
     my %config : shared = (min => 1,
                            max => 10,
-                           load => 100,
+                           load => 20,
+                           lifespan => 50000,
                            passid => 0,
-                           lifespan => 1000,
                           );
-    for ('min', 'max', 'load', 'passid', 'lifespan') {
-        $config{$_} = $arg{$_} if exists $arg{$_};
+    for ('min', 'max', 'load', 'lifespan', 'passid') {
+        $config{$_} = $arg{$_} if defined $arg{$_};
     }
-    my %code_ref;
-    $code_ref{pre} = $arg{pre} || [];
-    $code_ref{do} = $arg{do} || [];
-    $code_ref{post} = $arg{post} || [];
+    my %handler;
+    $handler{pre} = $arg{pre} || [];
+    $handler{do} = $arg{do} || [];
+    $handler{post} = $arg{post} || [];
 
-    my %obj : shared;
-    my $self = \%obj;
+    my $self = &share({});
     $self->{config} = \%config;
     $self->{pending} = Thread::Queue->new();
+    $self->{job} = &share({});
     $self->{done} = &share({});
-    $self->{worker} = &share({});
-    $self->{worker}{count} = 0;
-    my $state = 1;
-    $self->{state} = &share(\$state);
+    my $state : shared = 0;
+    $self->{state} = \$state;
+    my $worker : shared = 0;
+    $self->{worker} = \$worker;
+    $self->{run_lock} = Thread::Semaphore->new();
     bless $self, $class;
-    $self->{thread} = &share({});
     async {
-        $self->_run(\%code_ref);
+        $self->_run(\%handler);
     }->detach();
     return $self;
 }
 
 sub _run {
-    my ($self, $code_ref) = @_;
+    my ($self, $handler) = @_;
+    $self->{run_lock}->down();
     while (1) {
         last if $self->terminating();
-        $self->increase($code_ref) if $self->busy();
+        $self->increase($handler) if $self->busy();
         threads->yield();
     }
     my $worker = $self->{worker};
-    lock %$worker;
-    --$worker->{count};
-    cond_signal %$worker;
+    lock $$worker;
+    cond_wait $$worker while $$worker;
+    sleep 1;
+    $self->{run_lock}->up();
 }
 
 sub _handle {
-    my ($self, $code_ref) = @_;
-    my $do_code = $code_ref->{do};
-    my $do_func = shift @$do_code;
-    my ($passid, $lifespan) = do { lock %{$self->{config}}; @{$self->{config}}{'passid', 'lifespan'} };
-    while (!$self->terminating()
-           && $lifespan--
-           && 'CODE' eq ref $do_func
-          ) {
-
-        my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
-        last if $id == 1;
-        my $arg = thaw($job);
-        my @ret;
-        if ($id == 0) {
-            eval { scalar $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
-            next;
+    my ($self, $handler) = @_;
+    my $do = $handler->{do};
+    my $func = shift @$do;
+    my ($lifespan, $passid) = do { lock %{$self->{config}}; @{$self->{config}}{'lifespan', 'passid'} };
+    eval {
+        no strict 'refs';
+        while (!$self->terminating()
+               && $lifespan--
+              ) {
+            my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
+            if (!$id) {
+                $self->_state(-2);
+                last;
+            }
+            if (!$self->job_valid($id)) {
+                $self->_remove_job($id);
+                next;
+            }
+            my $arg = thaw($job);
+            my @ret;
+            if ($id % 3 == 2) {
+                if (defined $func) {
+                    eval { scalar $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
+                }
+                $self->_remove_job($id);
+                next;
+            }
+            elsif ($id % 3 == 1) {
+                if (defined $func) {
+                    @ret = eval { $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
+                }
+            }
+            else {
+                if (defined $func) {
+                    $ret[0] = eval { $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
+                }
+            }
+            $ret[0] = $@ if $@;
+            my $ret = nfreeze(\@ret);
+            if ($self->job_valid($id)) {
+                lock %{$self->{done}};
+                $self->{done}{$id} = $ret;
+                cond_signal %{$self->{done}};
+            }
+            else {
+                $self->_remove_job($id);
+            }
         }
-        elsif ($id % 2) {
-            $ret[0] = eval { $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
+        continue {
+            threads->yield();
         }
-        else {
-            @ret = eval { $do_func->($passid ? ($id, @$do_code, @$arg) : (@$do_code, @$arg)) };
-        }
-        $ret[0] = $@ if $@;
-        my $ret = nfreeze(\@ret);
-        {
-            lock %{$self->{done}};
-            $self->{done}{$id} = $ret;
-            cond_signal %{$self->{done}};
-        }
-        threads->yield();
-    }
-    my $post_code = $code_ref->{post};
-    my $post_func = shift @$post_code;
-    if ('CODE' eq ref $post_func) {
-        eval { $post_func->(@$post_code) };
+    };
+    carp "fatal error: $@" if $@;
+    my $post = $handler->{post};
+    $func = shift @$post;
+    if (defined $func) {
+        eval {
+            no strict 'refs';
+            $func->(@$post);
+        };
         carp $@ if $@;
     }
     my $worker = $self->{worker};
-    lock %$worker;
-    --$worker->{count};
-    cond_signal %$worker;
-}
-
-sub join {
-    my ($self) = @_;
-    $self->_state(-1);
-    my $worker = $self->{worker};
-    lock %$worker;
-    $self->{pending}->enqueue((pack('Na*', 1, '')) x $worker->{count});
-    cond_wait %$worker while $worker->{count} >= 0;
-}
-
-sub detach {
-    my ($self) = @_;
-    $self->_state(-1);
-    my $worker = $self->{worker};
-    lock %$worker;
-    $self->{pending}->enqueue((pack('Na*', 1, '')) x $worker->{count});
-}
-
-sub terminating {
-    my ($self) = @_;
-    my $state = $self->_state();
-    return unless $state < 0;
-    my $pending = $self->{pending}->pending();
-    return 1 if $state == -2 && !$pending;
-    my $done = do { lock %{$self->{done}}; keys %{$self->{done}} };
-    return 1 if $state == -1 && !$pending && !$done;
-    return;
-}
-
-sub increase {
-    my ($self, $code_ref) = @_;
-    eval {
-        my $worker = $self->{worker};
-        lock %$worker;
-        my $max = do { lock %{$self->{config}}; $self->{config}{max} };
-        return if $worker->{count} == $max;
-        my $pre_code = $code_ref->{pre};
-        my $pre_func = shift @$pre_code;
-        if ('CODE' eq ref $pre_func) {
-            eval { $pre_func->(@$pre_code) };
-            carp $@ if $@;
-        }
-        threads->create(\&_handle, $self, $code_ref)->detach();
-        ++$worker->{count};
-    };
-    carp "fail to add new thread: $@" if $@;
-}
-
-sub busy {
-    my ($self) = @_;
-    my $worker = do { lock %{$self->{worker}}; $self->{worker}{count} };
-    my ($min, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'load'} };
-    return $worker < $min
-      || $self->{pending}->pending() > $worker * $load;
+    lock $$worker;
+    --$$worker;
+    cond_signal $$worker;
 }
 
 sub _state {
@@ -164,7 +136,60 @@ sub _state {
     return $$state unless @_;
     my $s = shift;
     $$state = $s;
-    return $$state;
+    return $s;
+}
+
+sub join {
+    my ($self, $nb) = @_;
+    $self->_state(-1);
+    my $max = do { lock %{$self->{config}}; $self->{config}{max} };
+    $self->{pending}->enqueue((pack('Na*', 0, '')) x $max);
+    return if $nb;
+    $self->{run_lock}->down();
+}
+
+sub detach {
+    my ($self) = @_;
+    $self->join(1);
+}
+
+sub increase {
+    my ($self, $handler) = @_;
+    my $max = do { lock %{$self->{config}}; $self->{config}{max} };
+    my $worker = $self->{worker};
+    lock $$worker;
+    return unless $$worker < $max;
+    my $pre = $handler->{pre};
+    my $func = shift @$pre;
+    if (defined $func) {
+        eval {
+            no strict 'refs';
+            $func->(@$pre);
+        };
+        carp $@ if $@;
+    }
+    eval {
+        threads->create(\&_handle, $self, $handler)->detach();
+        ++$$worker;
+    };
+    carp "fail to add new thread: $@" if $@;
+}
+
+sub busy {
+    my ($self) = @_;
+    my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
+    my ($min, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'load'} };
+    return $worker < $min
+      || $self->{pending}->pending() > $worker * $load;
+}
+
+sub terminating {
+    my ($self) = @_;
+    my $state = $self->_state();
+    my $job = do { lock %{$self->{job}}; keys %{$self->{job}} };
+    return 1 if $state == -1 && !$job;
+    return 1 if $state == -2;
+    return;
 }
 
 sub config {
@@ -179,41 +204,85 @@ sub config {
 sub add {
     my $self = shift;
     my $context = wantarray;
+    $context = 2 unless defined $context; # void context = 2
     my $arg = nfreeze(\@_);
-    my $id = 0;
+    my $id;
     while (1) {
-        $id = int(rand(time())) if defined $context;
-        next if defined $context && $id < 10;
-        ++$id if defined $context && $context == $id % 2;
-        lock %{$self->{done}};
-        last unless exists $self->{done}{$id};
+        $id = int(rand(time()));
+        next unless $id;
+        ++$id unless $context == $id % 3;
+        ++$id unless $context == $id % 3;
+        lock %{$self->{job}};
+        next if exists $self->{job}{$id};
+        $self->{pending}->enqueue(pack('Na*', $id, $arg));
+        $self->{job}{$id} = 1;
+        last;
     }
-    $self->{pending}->enqueue(pack('Na*', $id, $arg));
     return $id;
+}
+
+sub job_valid {
+    my ($self, $id) = @_;
+    lock %{$self->{job}};
+    return $self->{job}{$id};
+}
+
+sub _remove_job {
+    my ($self, $id) = @_;
+    lock %{$self->{job}};
+    delete $self->{job}{$id};
+}
+
+sub _remove {
+    my ($self, $id, $nb) = @_;
+    return if $id % 3 == 2;
+    return unless $self->job_valid($id);
+    my ($exist, $ret);
+    {
+        lock %{$self->{done}};
+        if (!$nb) {
+            cond_wait %{$self->{done}} until exists $self->{done}{$id};
+            cond_signal %{$self->{done}} if 1 < keys %{$self->{done}};
+        }
+        $exist = ($ret) = delete $self->{done}{$id};
+    }
+    $self->_remove_job($id) if $exist;
+    return $exist unless defined $ret;
+    $ret = thaw($ret);
+    return ($exist, @$ret) if $id % 3 == 1;
+    return ($exist, $ret->[0]);
 }
 
 sub remove {
     my ($self, $id) = @_;
-    return unless $id;
-    lock %{$self->{done}};
-    cond_wait %{$self->{done}} until exists $self->{done}{$id};
-    cond_signal %{$self->{done}} if 1 < keys %{$self->{done}};
-    my $ret = delete $self->{done}{$id};
-    return unless defined $ret;
-    $ret = thaw($ret);
-    return $ret->[0] if $id % 2;
-    return @$ret;
+    my ($exist, @ret) = $self->_remove($id);
+    return @ret;
 }
+
 
 sub remove_nb {
     my ($self, $id) = @_;
-    return unless $id;
-    lock %{$self->{done}};
-    my $ret = delete $self->{done}{$id};
-    return unless defined $ret;
-    $ret = thaw($ret);
-    return ($id, $ret->[0]) if $id % 2;
-    return ($id, @$ret);
+    return $self->_remove($id, 1);
+}
+
+sub cancel {
+    my ($self, $id) = @_;
+    my ($exist) = $self->remove_nb($id);
+    if ($exist) {
+        $self->_remove_job($id);
+    }
+    else {
+        lock %{$self->{job}};
+        $self->{job}{$id} = 0;
+    }
+}
+
+sub cancel_all {
+    my ($self) = @_;
+    my @id = do { lock %{$self->{job}}; keys %{$self->{job}} };
+    for (@id) {
+        $self->cancel($_);
+    }
 }
 
 1;
@@ -238,15 +307,18 @@ Thread::Pool::Simple - A simple thread-pool implementation
                  lifespan => 10000,  # total jobs handled by each worker
                );
 
-  my ($id1) = $pool->add(@arg1); #call in list context
-  my $id2) = $pool->add(@arg2);  #call in scalar conetxt
-  $pool->add(@arg3)              #call in void context
+  my ($id1) = $pool->add(@arg1); # call in list context
+  my $id2 = $pool->add(@arg2);   # call in scalar conetxt
+  $pool->add(@arg3)              # call in void context
 
-  my @ret = $pool->remove($id1); #get result (block)
-  my $ret = $pool->remove_nb($id2); #get result (no block)
+  my @ret = $pool->remove($id1); # get result (block)
+  my $ret = $pool->remove_nb($id2); # get result (no block)
 
-  $pool->join();                 #wait till all jobs are done
-  $pool->detach();               #don't wait.
+  $pool->cancel($id1);           # cancel the job
+  $pool->cancel_all();           # cancel all jobs
+
+  $pool->join();                 # wait till all jobs are done
+  $pool->detach();               # don't wait.
 
 =head1 DESCRIPTION
 

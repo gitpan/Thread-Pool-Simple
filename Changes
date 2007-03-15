@@ -1,5 +1,8 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.10  14 MAR 2007
+        - added job cancelation support
+
 0.05  8 MAR 2007
         - re-added lifespan
         - fixed a `more than max worker' bug
