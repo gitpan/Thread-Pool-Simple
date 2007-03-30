@@ -9,127 +9,159 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.10';
+our $VERSION = '0.20';
 
 sub new {
-    my $class = shift;
-    my %arg = @_;
-    my %config : shared = (min => 1,
-                           max => 10,
-                           load => 20,
-                           lifespan => 50000,
-                           passid => 0,
-                          );
-    for ('min', 'max', 'load', 'lifespan', 'passid') {
-        $config{$_} = $arg{$_} if defined $arg{$_};
-    }
+    my ($class, %arg) = @_;
+    my %config : shared
+      = (min => ($arg{min} || 1),
+         max => ($arg{max} || 10),
+         load => ($arg{load} || 20),
+         lifespan => ($arg{lifespan} || 50000),
+         passid => ($arg{passid} || 0),
+        );
     my %handler;
-    $handler{pre} = $arg{pre} || [];
-    $handler{do} = $arg{do} || [];
-    $handler{post} = $arg{post} || [];
-
+    for (qw(pre do post)) {
+        next unless exists $arg{$_} && ref $arg{$_} eq 'ARRAY';
+        $handler{$_} = $arg{$_}
+    }
     my $self = &share({});
     $self->{config} = \%config;
     $self->{pending} = Thread::Queue->new();
-    $self->{job} = &share({});
+    $self->{submitted} = &share({});
     $self->{done} = &share({});
     my $state : shared = 0;
     $self->{state} = \$state;
     my $worker : shared = 0;
     $self->{worker} = \$worker;
-    $self->{run_lock} = Thread::Semaphore->new();
+    $self->{shutdown_lock} = Thread::Semaphore->new();
     bless $self, $class;
+    $self->{shutdown_lock}->down();
     async {
         $self->_run(\%handler);
+        $self->{shutdown_lock}->up();
     }->detach();
     return $self;
 }
 
-sub _run {
+sub _run : locked method {
     my ($self, $handler) = @_;
-    $self->{run_lock}->down();
     while (1) {
         last if $self->terminating();
-        $self->increase($handler) if $self->busy();
+        $self->_increase($handler) if $self->busy();
         threads->yield();
     }
     my $worker = $self->{worker};
-    lock $$worker;
-    cond_wait $$worker while $$worker;
-    sleep 1;
-    $self->{run_lock}->up();
+    {
+        lock $$worker;
+        cond_wait $$worker while $$worker;
+    }
+}
+
+sub _increase : locked method {
+    my ($self, $handler) = @_;
+    my $max = do { lock %{$self->{config}}; $self->{config}{max} };
+    my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
+    return unless $worker < $max;
+
+    $self->_handle_func($handler->{pre});
+
+    eval {
+        threads->create(\&_handle, $self, $handler)->detach();
+        lock ${$self->{worker}};
+        ++${$self->{worker}};
+    };
+    carp "fail to add new thread: $@" if $@;
 }
 
 sub _handle {
     my ($self, $handler) = @_;
     my $do = $handler->{do};
-    my $func = shift @$do;
-    my ($lifespan, $passid) = do { lock %{$self->{config}}; @{$self->{config}}{'lifespan', 'passid'} };
+    my $func = defined $do ? shift @$do : undef;
+    my ($lifespan, $passid)
+      = do {
+          lock %{$self->{config}};
+          @{$self->{config}}{qw(lifespan passid)}
+      };
     eval {
-        no strict 'refs';
         while (!$self->terminating()
                && $lifespan--
               ) {
-            my ($id, $job) = unpack('Na*', $self->{pending}->dequeue());
-            if (!$id) {
-                $self->_state(-2);
-                last;
-            }
-            if (!$self->job_valid($id)) {
-                $self->_remove_job($id);
-                next;
-            }
+            my ($id, $job) = unpack 'Na*', $self->{pending}->dequeue();
+            $self->_state(-2) && last unless $id;
+            $self->_drop($id) && next unless $self->job_exists($id);
+
             my $arg = thaw($job);
             my @ret;
-            if ($id % 3 == 2) {
+            if ($id % 3 == 2) {  # void context
                 if (defined $func) {
-                    eval { scalar $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
+                    eval {
+                        no strict 'refs';
+                        scalar $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg));
+                    };
+                    $self->_drop($id);
+                    next;
                 }
-                $self->_remove_job($id);
-                next;
             }
-            elsif ($id % 3 == 1) {
+            elsif ($id % 3 == 1) { # list context
                 if (defined $func) {
-                    @ret = eval { $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
+                    @ret = eval {
+                        no strict 'refs';
+                        $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg));
+                    };
                 }
+            }
+            else { # scalar context
+                if (defined $func) {
+                    $ret[0] = eval {
+                        no strict 'refs';
+                        $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg));
+                    };
+                }
+            }
+
+            $self->_drop($id) && next unless $self->job_exists($id);
+
+            if ($@) {
+                @ret = ('e', $@);
             }
             else {
-                if (defined $func) {
-                    $ret[0] = eval { $func->($passid ? ($id, @$do, @$arg) : (@$do, @$arg)) };
-                }
+                unshift @ret, 'n';
             }
-            $ret[0] = $@ if $@;
             my $ret = nfreeze(\@ret);
-            if ($self->job_valid($id)) {
+            {
                 lock %{$self->{done}};
                 $self->{done}{$id} = $ret;
                 cond_signal %{$self->{done}};
-            }
-            else {
-                $self->_remove_job($id);
             }
         }
         continue {
             threads->yield();
         }
     };
-    carp "fatal error: $@" if $@;
-    my $post = $handler->{post};
-    $func = shift @$post;
-    if (defined $func) {
-        eval {
-            no strict 'refs';
-            $func->(@$post);
-        };
-        carp $@ if $@;
-    }
+    carp "job handling error: $@" if $@;
+
+    $self->_handle_func($handler->{post});
+
     my $worker = $self->{worker};
     lock $$worker;
     --$$worker;
     cond_signal $$worker;
 }
 
-sub _state {
+sub _handle_func {
+    my ($self, $handler) = @_;
+    my $func = defined $handler ? shift @$handler : undef;
+    if (defined $func) {
+        eval {
+            no strict 'refs';
+            $func->(@$handler);
+        };
+        carp $@ if $@;
+    }
+}
+
+sub _state : locked method {
     my $self = shift;
     my $state = $self->{state};
     lock $$state;
@@ -139,43 +171,22 @@ sub _state {
     return $s;
 }
 
-sub join {
+sub join : locked method {
     my ($self, $nb) = @_;
     $self->_state(-1);
     my $max = do { lock %{$self->{config}}; $self->{config}{max} };
     $self->{pending}->enqueue((pack('Na*', 0, '')) x $max);
     return if $nb;
-    $self->{run_lock}->down();
+    $self->{shutdown_lock}->down();
+    sleep 1; # cool down, otherwise may coredump while run tests
 }
 
-sub detach {
+sub detach : locked method {
     my ($self) = @_;
     $self->join(1);
 }
 
-sub increase {
-    my ($self, $handler) = @_;
-    my $max = do { lock %{$self->{config}}; $self->{config}{max} };
-    my $worker = $self->{worker};
-    lock $$worker;
-    return unless $$worker < $max;
-    my $pre = $handler->{pre};
-    my $func = shift @$pre;
-    if (defined $func) {
-        eval {
-            no strict 'refs';
-            $func->(@$pre);
-        };
-        carp $@ if $@;
-    }
-    eval {
-        threads->create(\&_handle, $self, $handler)->detach();
-        ++$$worker;
-    };
-    carp "fail to add new thread: $@" if $@;
-}
-
-sub busy {
+sub busy : locked method {
     my ($self) = @_;
     my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
     my ($min, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'load'} };
@@ -183,16 +194,16 @@ sub busy {
       || $self->{pending}->pending() > $worker * $load;
 }
 
-sub terminating {
+sub terminating : locked method {
     my ($self) = @_;
     my $state = $self->_state();
-    my $job = do { lock %{$self->{job}}; keys %{$self->{job}} };
+    my $job = do { lock %{$self->{submitted}}; keys %{$self->{submitted}} };
     return 1 if $state == -1 && !$job;
     return 1 if $state == -2;
     return;
 }
 
-sub config {
+sub config : locked method {
     my $self = shift;
     my $config = $self->{config};
     lock %$config;
@@ -201,7 +212,7 @@ sub config {
     return %$config;
 }
 
-sub add {
+sub add : locked method {
     my $self = shift;
     my $context = wantarray;
     $context = 2 unless defined $context; # void context = 2
@@ -212,31 +223,31 @@ sub add {
         next unless $id;
         ++$id unless $context == $id % 3;
         ++$id unless $context == $id % 3;
-        lock %{$self->{job}};
-        next if exists $self->{job}{$id};
+        lock %{$self->{submitted}};
+        next if exists $self->{submitted}{$id};
         $self->{pending}->enqueue(pack('Na*', $id, $arg));
-        $self->{job}{$id} = 1;
+        $self->{submitted}{$id} = 1;
         last;
     }
     return $id;
 }
 
-sub job_valid {
+sub job_exists : locked method {
     my ($self, $id) = @_;
-    lock %{$self->{job}};
-    return $self->{job}{$id};
+    lock %{$self->{submitted}};
+    return $self->{submitted}{$id};
 }
 
-sub _remove_job {
+sub _drop : locked method {
     my ($self, $id) = @_;
-    lock %{$self->{job}};
-    delete $self->{job}{$id};
+    lock %{$self->{submitted}};
+    delete $self->{submitted}{$id};
 }
 
-sub _remove {
+sub _remove : locked method {
     my ($self, $id, $nb) = @_;
     return if $id % 3 == 2;
-    return unless $self->job_valid($id);
+    return unless $self->job_exists($id);
     my ($exist, $ret);
     {
         lock %{$self->{done}};
@@ -246,40 +257,39 @@ sub _remove {
         }
         $exist = ($ret) = delete $self->{done}{$id};
     }
-    $self->_remove_job($id) if $exist;
+    $self->_drop($id) if $exist;
     return $exist unless defined $ret;
     $ret = thaw($ret);
+    my $err = shift @$ret;
+    croak $ret->[0] if $err eq 'e';
     return ($exist, @$ret) if $id % 3 == 1;
     return ($exist, $ret->[0]);
 }
 
-sub remove {
+sub remove : locked method {
     my ($self, $id) = @_;
     my ($exist, @ret) = $self->_remove($id);
     return @ret;
 }
 
 
-sub remove_nb {
+sub remove_nb : locked method {
     my ($self, $id) = @_;
     return $self->_remove($id, 1);
 }
 
-sub cancel {
+sub cancel : locked method {
     my ($self, $id) = @_;
-    my ($exist) = $self->remove_nb($id);
-    if ($exist) {
-        $self->_remove_job($id);
-    }
-    else {
-        lock %{$self->{job}};
-        $self->{job}{$id} = 0;
+    my ($exist) = eval { $self->remove_nb($id) };
+    if (!$exist) {
+        lock %{$self->{submitted}};
+        $self->{submitted}{$id} = 0;
     }
 }
 
-sub cancel_all {
+sub cancel_all : locked method {
     my ($self) = @_;
-    my @id = do { lock %{$self->{job}}; keys %{$self->{job}} };
+    my @id = do { lock %{$self->{submitted}}; keys %{$self->{submitted}} };
     for (@id) {
         $self->cancel($_);
     }
@@ -340,3 +350,5 @@ This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself.
 
 =cut
+
+

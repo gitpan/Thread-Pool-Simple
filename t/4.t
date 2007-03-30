@@ -14,14 +14,14 @@ BEGIN { use_ok('Thread::Pool::Simple') };
 my $pool = Thread::Pool::Simple->new(min => 5,
                                      load => 5,
                                      max => 10,
-                                     do => [sub {  return @_; }],
+                                     do => [sub {  return 444/($_[0] - 1); }],
                                     );
 
 
-for (1..1000) {
-    my @arg = (1, 2, 3);
-    my ($id, @ret);
-    $pool->add(@arg);
-}
+my @arg = (1, 2, 3);
+my ($id, @ret);
+$id = $pool->add(@arg);
+eval { @ret = $pool->remove($id) };
+ok ($@ =~ /Illegal division by zero/);
 
 $pool->join();
