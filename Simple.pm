@@ -9,7 +9,7 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.20';
+our $VERSION = '0.21';
 
 sub new {
     my ($class, %arg) = @_;
@@ -151,11 +151,13 @@ sub _handle {
 
 sub _handle_func {
     my ($self, $handler) = @_;
-    my $func = defined $handler ? shift @$handler : undef;
+    return unless defined $handler;
+    my @arg = @$handler;
+    my $func = shift @arg;
     if (defined $func) {
         eval {
             no strict 'refs';
-            $func->(@$handler);
+            $func->(@arg);
         };
         carp $@ if $@;
     }
@@ -189,9 +191,12 @@ sub detach : locked method {
 sub busy : locked method {
     my ($self) = @_;
     my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
-    my ($min, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'load'} };
-    return $worker < $min
-      || $self->{pending}->pending() > $worker * $load;
+    my ($min, $max, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'max', 'load'} };
+    my $pending = $self->{pending}->pending();
+
+    # do not count the fake job added after join()
+    $pending -= $max if $self->_state() == -1;
+    return $worker < $min || $pending > $worker * $load;
 }
 
 sub terminating : locked method {

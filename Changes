@@ -1,5 +1,10 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.21  9 MAY 2007
+        - fixed two defects found by Dominik Gehl
+        - 1. always call pre_handler() before creating the thread
+        - 2. do not count ``fake'' job in busy()
+
 0.20  29 MAR 2007
         - reworked some code
 
