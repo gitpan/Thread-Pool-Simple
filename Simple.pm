@@ -9,7 +9,7 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.21';
+our $VERSION = '0.22';
 
 sub new {
     my ($class, %arg) = @_;
@@ -21,7 +21,7 @@ sub new {
          passid => ($arg{passid} || 0),
         );
     my %handler;
-    for (qw(pre do post)) {
+    for (qw(init pre do post)) {
         next unless exists $arg{$_} && ref $arg{$_} eq 'ARRAY';
         $handler{$_} = $arg{$_}
     }
@@ -49,7 +49,7 @@ sub _run : locked method {
     while (1) {
         last if $self->terminating();
         $self->_increase($handler) if $self->busy();
-        threads->yield();
+        sleep 1;
     }
     my $worker = $self->{worker};
     {
@@ -64,7 +64,7 @@ sub _increase : locked method {
     my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
     return unless $worker < $max;
 
-    $self->_handle_func($handler->{pre});
+    $self->_handle_func($handler->{init});
 
     eval {
         threads->create(\&_handle, $self, $handler)->detach();
@@ -76,6 +76,9 @@ sub _increase : locked method {
 
 sub _handle {
     my ($self, $handler) = @_;
+
+    $self->_handle_func($handler->{pre});
+
     my $do = $handler->{do};
     my $func = defined $do ? shift @$do : undef;
     my ($lifespan, $passid)
@@ -228,10 +231,17 @@ sub add : locked method {
         next unless $id;
         ++$id unless $context == $id % 3;
         ++$id unless $context == $id % 3;
-        lock %{$self->{submitted}};
-        next if exists $self->{submitted}{$id};
-        $self->{pending}->enqueue(pack('Na*', $id, $arg));
-        $self->{submitted}{$id} = 1;
+        {
+            lock %{$self->{submitted}};
+            next if $self->job_exists($id);
+            {
+                # this is necessary as some cancelled jobs may slip in
+                lock %{$self->{done}};
+                delete $self->{done}{$id};
+            }
+            $self->{pending}->enqueue(pack('Na*', $id, $arg));
+            $self->{submitted}{$id} = 1;
+        }
         last;
     }
     return $id;
@@ -241,6 +251,12 @@ sub job_exists : locked method {
     my ($self, $id) = @_;
     lock %{$self->{submitted}};
     return $self->{submitted}{$id};
+}
+
+sub job_done : locked method {
+    my ($self, $id) = @_;
+    lock %{$self->{done}};
+    return $self->{done}{$id};
 }
 
 sub _drop : locked method {
@@ -315,9 +331,10 @@ Thread::Pool::Simple - A simple thread-pool implementation
                  min => 3,           # at least 3 workers
                  max => 5,           # at most 5 workers
                  load => 10,         # increase worker if on average every worker has 10 jobs waiting
-                 pre => [\&pre_handle, $arg1, $arg2, ...]   # run before creating worker thread
+                 init => [\&init_handle, $arg1, $arg2, ...]   # run before creating worker thread
+                 pre => [\&pre_handle, $arg1, $arg2, ...]   # run after creating worker thread
                  do => [\&do_handle, $arg1, $arg2, ...]     # job handler for each worker
-                 post => [\&post_handle, $arg1, $arg2, ...] # run after worker threads end
+                 post => [\&post_handle, $arg1, $arg2, ...] # run before worker threads end
                  passid => 1,        # whether to pass the job id as the first argument to the &do_handle
                  lifespan => 10000,  # total jobs handled by each worker
                );

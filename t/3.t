@@ -24,7 +24,6 @@ for (1..300) {
     $pool->add(@arg);
 
     ($id) = $pool->add(@arg);
-
     ($id) = $pool->add(@arg);
     $pool->cancel($id);
 
@@ -40,6 +39,7 @@ for (1..300) {
 
     ($id) = $pool->add(@arg);
     @ret = $pool->remove($id);
+
     ok("@ret" eq "@arg");
 
     ($id) = $pool->add(@arg);

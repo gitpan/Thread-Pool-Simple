@@ -1,5 +1,12 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.22  10 MAY 2007
+        - corrected a race condition where cancelled jobs may slip
+          into the done queue
+        - added ``init'' handler
+        - calling ``sleep'' instead of ``yield'' in main thread to
+          reduce the number of besy() tests
+
 0.21  9 MAY 2007
         - fixed two defects found by Dominik Gehl
         - 1. always call pre_handler() before creating the thread
