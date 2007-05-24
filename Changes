@@ -1,5 +1,9 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.23  24 MAY 2007
+        - only calling ``sleep'' when not busy to avoid 1 sec delay
+          during thread creation
+
 0.22  10 MAY 2007
         - corrected a race condition where cancelled jobs may slip
           into the done queue

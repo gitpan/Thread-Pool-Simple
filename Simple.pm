@@ -9,7 +9,7 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.22';
+our $VERSION = '0.23';
 
 sub new {
     my ($class, %arg) = @_;
@@ -48,8 +48,13 @@ sub _run : locked method {
     my ($self, $handler) = @_;
     while (1) {
         last if $self->terminating();
-        $self->_increase($handler) if $self->busy();
-        sleep 1;
+        if ($self->busy()) {
+            $self->_increase($handler);
+        }
+        else {
+            sleep 1;
+        }
+        threads->yield();
     }
     my $worker = $self->{worker};
     {
