@@ -1,5 +1,10 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.24  3 SEP 2009
+      	- used a workaround to avoid a rare problem when running under
+	  perl debuger (thanks to Kevin Brintnall)
+	- removed redundant ``:locked method'' 
+
 0.23  24 MAY 2007
         - only calling ``sleep'' when not busy to avoid 1 sec delay
           during thread creation

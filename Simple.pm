@@ -9,7 +9,7 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.23';
+our $VERSION = '0.24';
 
 sub new {
     my ($class, %arg) = @_;
@@ -37,14 +37,16 @@ sub new {
     $self->{shutdown_lock} = Thread::Semaphore->new();
     bless $self, $class;
     $self->{shutdown_lock}->down();
-    async {
-        $self->_run(\%handler);
-        $self->{shutdown_lock}->up();
-    }->detach();
+    my $thr = threads->new(
+	sub {
+	    $self->_run(\%handler);
+	    $self->{shutdown_lock}->up();
+	}) or croak "fail to create new thread"; 
+    $thr->detach();
     return $self;
 }
 
-sub _run : locked method {
+sub _run {
     my ($self, $handler) = @_;
     while (1) {
         last if $self->terminating();
@@ -63,7 +65,7 @@ sub _run : locked method {
     }
 }
 
-sub _increase : locked method {
+sub _increase {
     my ($self, $handler) = @_;
     my $max = do { lock %{$self->{config}}; $self->{config}{max} };
     my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
@@ -171,7 +173,7 @@ sub _handle_func {
     }
 }
 
-sub _state : locked method {
+sub _state {
     my $self = shift;
     my $state = $self->{state};
     lock $$state;
@@ -181,7 +183,7 @@ sub _state : locked method {
     return $s;
 }
 
-sub join : locked method {
+sub join {
     my ($self, $nb) = @_;
     $self->_state(-1);
     my $max = do { lock %{$self->{config}}; $self->{config}{max} };
@@ -191,12 +193,12 @@ sub join : locked method {
     sleep 1; # cool down, otherwise may coredump while run tests
 }
 
-sub detach : locked method {
+sub detach {
     my ($self) = @_;
     $self->join(1);
 }
 
-sub busy : locked method {
+sub busy {
     my ($self) = @_;
     my $worker = do { lock ${$self->{worker}}; ${$self->{worker}} };
     my ($min, $max, $load) = do { lock %{$self->{config}}; @{$self->{config}}{'min', 'max', 'load'} };
@@ -207,7 +209,7 @@ sub busy : locked method {
     return $worker < $min || $pending > $worker * $load;
 }
 
-sub terminating : locked method {
+sub terminating {
     my ($self) = @_;
     my $state = $self->_state();
     my $job = do { lock %{$self->{submitted}}; keys %{$self->{submitted}} };
@@ -216,7 +218,7 @@ sub terminating : locked method {
     return;
 }
 
-sub config : locked method {
+sub config {
     my $self = shift;
     my $config = $self->{config};
     lock %$config;
@@ -225,7 +227,7 @@ sub config : locked method {
     return %$config;
 }
 
-sub add : locked method {
+sub add {
     my $self = shift;
     my $context = wantarray;
     $context = 2 unless defined $context; # void context = 2
@@ -252,25 +254,25 @@ sub add : locked method {
     return $id;
 }
 
-sub job_exists : locked method {
+sub job_exists {
     my ($self, $id) = @_;
     lock %{$self->{submitted}};
     return $self->{submitted}{$id};
 }
 
-sub job_done : locked method {
+sub job_done {
     my ($self, $id) = @_;
     lock %{$self->{done}};
     return $self->{done}{$id};
 }
 
-sub _drop : locked method {
+sub _drop {
     my ($self, $id) = @_;
     lock %{$self->{submitted}};
     delete $self->{submitted}{$id};
 }
 
-sub _remove : locked method {
+sub _remove {
     my ($self, $id, $nb) = @_;
     return if $id % 3 == 2;
     return unless $self->job_exists($id);
@@ -292,19 +294,19 @@ sub _remove : locked method {
     return ($exist, $ret->[0]);
 }
 
-sub remove : locked method {
+sub remove {
     my ($self, $id) = @_;
     my ($exist, @ret) = $self->_remove($id);
     return @ret;
 }
 
 
-sub remove_nb : locked method {
+sub remove_nb {
     my ($self, $id) = @_;
     return $self->_remove($id, 1);
 }
 
-sub cancel : locked method {
+sub cancel {
     my ($self, $id) = @_;
     my ($exist) = eval { $self->remove_nb($id) };
     if (!$exist) {
@@ -313,7 +315,7 @@ sub cancel : locked method {
     }
 }
 
-sub cancel_all : locked method {
+sub cancel_all {
     my ($self) = @_;
     my @id = do { lock %{$self->{submitted}}; keys %{$self->{submitted}} };
     for (@id) {
