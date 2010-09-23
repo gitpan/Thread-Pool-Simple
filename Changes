@@ -1,5 +1,9 @@
 Revision history for Perl extension Thread::Pool::Simple.
 
+0.25  23 SEP 2010
+        - fixd [rt.cpan.org #61557] "add" method randomly fails to fire on Win32
+          (thanks Aaron Wirtz for reporting and providing a fix)  
+
 0.24  3 SEP 2009
       	- used a workaround to avoid a rare problem when running under
 	  perl debuger (thanks to Kevin Brintnall)

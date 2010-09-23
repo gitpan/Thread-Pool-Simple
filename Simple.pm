@@ -9,7 +9,7 @@ use Storable qw(nfreeze thaw);
 use Thread::Queue;
 use Thread::Semaphore;
 
-our $VERSION = '0.24';
+our $VERSION = '0.25';
 
 sub new {
     my ($class, %arg) = @_;
@@ -238,7 +238,7 @@ sub add {
         next unless $id;
         ++$id unless $context == $id % 3;
         ++$id unless $context == $id % 3;
-        {
+        do {
             lock %{$self->{submitted}};
             next if $self->job_exists($id);
             {
@@ -248,7 +248,7 @@ sub add {
             }
             $self->{pending}->enqueue(pack('Na*', $id, $arg));
             $self->{submitted}{$id} = 1;
-        }
+        };
         last;
     }
     return $id;
